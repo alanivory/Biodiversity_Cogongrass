@@ -1,0 +1,707 @@
+---
+title: "Scree Plots"
+author: "Alan Ivory"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+pacman::p_load(dplyr, readxl, tidyr, raster, vegan, tigris, sf, sp, plotly, ggrepel, kableExtra, webshot, viridis, RColorBrewer, gridExtra, patchwork, ggrepel)
+
+
+# Tree PCQ Data
+tree_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Tree_PCQ")
+
+# Soil Data
+fuel_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Fuel_Sampling")
+
+# Veg Data
+Veg_Cover <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Veg_Cover")
+
+# Shrub Cover Data
+shrub_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                         sheet = "Shrub_Cover")
+
+# Ground Cover Data
+ground_cover <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                           sheet = "Ground_Cover")
+
+# Site Data
+CogonSites <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/CogonSites_FL_AL_MS.xlsx")
+
+# Count the total number of quadrats per plot
+quadrat_count <- Veg_Cover %>%
+  group_by(Plot) %>%
+  summarize(total_quadrats = n_distinct(Quadrat), .groups = "drop")
+```
+
+## Species Matrix Function
+```{r species_matrix}
+create_matrix_by_rarity <- function(rarity_threshold,
+                                    tree_data_raw,
+                                    veg_cover_raw,
+                                    shrub_data_raw,
+                                    ground_cover_raw,
+                                    cogon_sites_raw,
+                                    quadrat_counts_df) {
+
+  total_sites <- nrow(cogon_sites_raw)
+
+  # --- Pre-filter by growth form ---
+  tree_data_raw  <- tree_data_raw %>%
+    filter(Growth == "Tree")
+
+  veg_cover_raw  <- veg_cover_raw %>%
+    filter(Growth != "Shrub" & Growth != "Tree")
+
+  shrub_data_raw <- shrub_data_raw %>%
+    filter(Growth == "Shrub" | Growth == "Tree")
+
+  # --- Filter ground cover (remove stumps) ---
+  ground_cover_raw <- ground_cover_raw %>%
+    filter(Ground_Cover_Type != "Stump")
+
+  # --- Filter by frequency ---
+  filter_by_frequency <- function(df, threshold) {
+    freq <- df %>%
+      group_by(Species) %>%
+      summarise(Frequency = n_distinct(Plot) / total_sites * 100) %>%
+      filter(Frequency >= threshold)
+
+    df %>%
+      filter(Species %in% freq$Species)
+  }
+
+  tree_data_filtered  <- filter_by_frequency(tree_data_raw, rarity_threshold)
+  veg_cover_filtered  <- filter_by_frequency(veg_cover_raw, rarity_threshold)
+  shrub_data_filtered <- filter_by_frequency(shrub_data_raw, rarity_threshold)
+
+  # --- Shrub Cover Conversion ---
+  shrub_cover <- shrub_data_filtered %>%
+    mutate(Cover = Line_End - Line_Start) %>%
+    group_by(Species_Name, Plot) %>%
+    summarise(Total_Cover = sum(Cover, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Percent_Cover = Total_Cover / 3000 * 100)
+
+  # --- Herbaceous Cover Conversion ---
+  ground_cover_renamed <- ground_cover_raw %>%
+    rename(Species_Name = Ground_Cover_Type)
+
+  veg_cover_combined <- ground_cover_renamed %>%
+    full_join(veg_cover_filtered,
+              by = c("Date", "Observer", "Weather", "Plot", "Site",
+                     "Quadrat", "Canopy_Cover", "Species_Name", "Cover", "Cover_Per")) %>%
+    left_join(cogon_sites_raw, by = "Plot")
+
+  veg_cover_summed <- veg_cover_combined %>%
+    group_by(Plot, Species_Name) %>%
+    summarize(total_cover = sum(Cover_Per, na.rm = TRUE), .groups = "drop")
+
+  avg_species_cover <- veg_cover_summed %>%
+    left_join(quadrat_counts_df, by = "Plot") %>%
+    mutate(avg_cover = total_cover / total_quadrats)
+
+  # --- Merge Herb and Shrub Cover ---
+  combined_cover <- avg_species_cover %>%
+    full_join(
+      shrub_cover %>% select(Plot, Species_Name, Percent_Cover),
+      by = c("Plot", "Species_Name")
+    ) %>%
+    mutate(
+      overlap_flag = ifelse(!is.na(avg_cover) & !is.na(Percent_Cover), TRUE, FALSE),
+      final_cover = case_when(
+        !is.na(avg_cover) & is.na(Percent_Cover) ~ avg_cover,
+        is.na(avg_cover) & !is.na(Percent_Cover) ~ Percent_Cover,
+        TRUE ~ NA_real_
+      )
+    )
+
+  # --- Species Matrix ---
+  species_matrix <- combined_cover %>%
+    select(Plot, Species_Name, final_cover) %>%
+    filter(!is.na(Species_Name)) %>%
+    pivot_wider(
+      names_from  = Species_Name,
+      values_from = final_cover,
+      values_fill = 0
+    )
+
+  return(species_matrix)
+}
+```
+
+## Stress Runs
+```{r stress_runs}
+# Define the parameters
+rarity_thresholds <- c(0, 1, 3, 5, 10) # Species must be in at least 0%, 1%, 3%, 5%, or 10% of sites
+k_values <- 1:8 # Test dimensions 1 through 8
+
+# Create an empty data frame to store the results
+all_stress_results <- data.frame(
+  rarity = numeric(),
+  k = integer(),
+  stress = numeric(),
+  num_species = integer()
+)
+
+# --- Start the nested loops ---
+for (thresh in rarity_thresholds) {
+  
+  cat("Running for rarity threshold:", thresh, "%\n")
+  
+
+  current_species_matrix <- create_matrix_by_rarity(
+    rarity_threshold = thresh,
+    tree_data_raw = tree_data,
+    veg_cover_raw = Veg_Cover, 
+    shrub_data_raw = shrub_data,
+    ground_cover_raw = ground_cover,
+    cogon_sites_raw = CogonSites,
+    quadrat_counts_df = quadrat_count
+  )
+  
+  # Check if matrix is valid (at least 2 species columns)
+  if (ncol(current_species_matrix) < 3) {
+    cat("  Skipping threshold", thresh, "%: not enough species remained.\n")
+    next
+  }
+  
+  # Inner loop for k values
+  for (k_val in k_values) {
+    set.seed(123)
+    nmds_run <- metaMDS(
+      current_species_matrix[, -1], 
+      distance = "bray", 
+      k = k_val, 
+      trymax = 100,
+      autotransform = FALSE,
+      trace = 0 
+    )
+    
+    # results
+    result_row <- data.frame(
+      rarity = thresh,
+      k = k_val,
+      stress = nmds_run$stress,
+      num_species = ncol(current_species_matrix) - 1 
+    )
+    all_stress_results <- rbind(all_stress_results, result_row)
+  }
+}
+
+print(all_stress_results)
+```
+
+## Scree Plots
+```{r scree_plots}
+ggplot(all_stress_results, aes(x = k, y = stress, color = as.factor(rarity))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0.20, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.10, linetype = "dashed", color = "darkgreen") +
+  annotate("text", x = max(k_values) * 0.9, y = 0.21, label = "Stress = 0.20", color = "red", size = 3) +
+  annotate("text", x = max(k_values) * 0.9, y = 0.11, label = "Stress = 0.10", color = "darkgreen", size = 3) +
+  
+  labs(
+    title = "NMDS Stress vs. Number of Dimensions",
+    x = "Number of Dimensions (k)",
+    y = "Stress Value",
+    color = "Rarity Filter\n(% of Sites)"
+  ) +
+  scale_color_viridis_d() +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Final NMDS
+```{r final_nmds}
+
+species_matrix <- create_matrix_by_rarity(
+  rarity_threshold = 0,
+  tree_data_raw = tree_data,
+  veg_cover_raw = Veg_Cover,
+  shrub_data_raw = shrub_data,
+  ground_cover_raw = ground_cover,
+  cogon_sites_raw = CogonSites,
+  quadrat_counts_df = quadrat_count
+)
+
+
+set.seed(123)
+final_nmds <- metaMDS(species_matrix[, -1], 
+                      distance = "bray", 
+                      k = 4, 
+                      trymax = 250,
+                      autotransform = FALSE)
+
+final_nmds$stress
+
+# Extract site scores
+site_scores <- as.data.frame(scores(final_nmds, "sites"))
+site_scores$Plot <- species_matrix$Plot 
+
+plot_metadata <- CogonSites %>%
+  distinct(Plot, .keep_all = TRUE)
+
+site_scores <- left_join(site_scores, plot_metadata, by = "Plot")
+
+# Extract species scores
+species_scores <- as.data.frame(scores(final_nmds, "species"))
+species_scores$species <- rownames(species_scores)
+```
+
+## Justification Plot
+```{r justification_plot}
+plot_A <- ggplot(all_stress_results, aes(x = k, y = stress, color = as.factor(rarity))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0.2, linetype = "dashed") +
+  geom_hline(yintercept = 0.12, linetype = "dashed") +
+  annotate("text", x = 1, y = 0.21, label = "Fair fit", hjust = 0, size=3) +
+  annotate("text", x = 1, y = 0.13, label = "Good fit", hjust = 0, size=3) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+  #  title = "A) Model Fit Justification",
+    x = "Number of Dimensions (k)",
+    y = "Stress Value",
+    color = "Rarity Filter (% of Sites)"
+  ) +
+  theme_bw()
+
+plot_A <- plot_A + 
+  geom_point(data = data.frame(k=4, stress=final_nmds$stress), 
+             aes(x=k, y=stress), color="black", size=5, shape=1)
+
+# Save the plot
+ggsave("Figure_1A_NMDS_Stress_Justification.png", plot = plot_A, width = 6, height = 4, dpi = 300)
+
+```
+
+## Main Ordination Plot (Community Composition)
+```{r main_ordination_plot}
+hulls <- site_scores %>%
+  group_by(Status) %>%
+  slice(chull(NMDS1, NMDS2))
+
+plot_B <- ggplot(site_scores, aes(x = NMDS1, y = NMDS2)) +
+  geom_polygon(data = hulls, aes(fill = Status), alpha = 0.2) +
+  geom_point(aes(color = Status, shape = Status), size = 3) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "B) Plant Community Composition",
+    subtitle = paste("Final NMDS (k=4), Stress =", round(final_nmds$stress, 3)),
+    x = "NMDS Axis 1",
+    y = "NMDS Axis 2"
+  ) +
+  theme_bw() +
+  coord_equal()
+```
+
+# Ordination with Environmental Overlay
+```{r env_overlay}
+cogon_cover_data <- species_matrix %>%
+    select(Plot, Avg_Cogongrass_Cover = Imperata_cylindrica)
+
+site_scores <- left_join(site_scores, cogon_cover_data, by = "Plot")
+
+
+env_vars <- site_scores %>%
+  select(where(is.numeric)) %>%
+  select(-starts_with("NMDS"), -any_of(c("Site", "Muname", "SoilType", "Camera")))
+
+
+print(names(env_vars))
+
+
+set.seed(123)
+env_fit <- envfit(final_nmds, env_vars, permutations = 999, na.rm = TRUE)
+
+env_scores <- as.data.frame(scores(env_fit, "vectors"))
+env_scores$variable <- rownames(env_scores)
+env_scores$p_value <- env_fit$vectors$pvals
+
+# significant vectors (e.g., p < 0.05)
+sig_env_scores <- subset(env_scores, p_value < 0.05)
+
+plot_C <- ggplot(site_scores, aes(x = NMDS1, y = NMDS2)) +
+  geom_point(aes(color = Avg_Cogongrass_Cover), size = 3, alpha = 0.8) +
+  scale_color_viridis_c(direction = -1) + 
+  
+  geom_segment(data = sig_env_scores,
+               aes(x = 0, y = 0, xend = NMDS1 * 0.8, yend = NMDS2 * 0.8),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "black") +
+               
+  # labels for the vectors
+  geom_text_repel(data = sig_env_scores,
+                  aes(x = NMDS1 * 0.9, y = NMDS2 * 0.9, label = variable),
+                  color = "black",
+                  fontface = "bold",
+                  size = 2.5,  
+                  min.segment.length = 0, 
+                  box.padding = 0.5) +  
+                  
+  labs(
+    title = "C) Environmental Drivers",
+    x = "NMDS Axis 1",
+    y = "NMDS Axis 2",
+    color = "Cogongrass\nCover (%)"
+  ) +
+  theme_bw() +
+  coord_equal()
+```
+
+## Patchwork
+```{r patchwork}
+# Arrange the plots
+final_figure <- plot_A / (plot_B + plot_C)
+
+final_figure
+
+# ggsave("Figure_1_NMDS_Results.png", plot = final_figure, width = 10, height = 8, dpi = 300)
+```
+
+## Plot of subplots B and C
+```{r plot_B_and_C}
+# UF Gator colors
+gator_blue   <- "#0021A5"
+gator_orange <- "#FA4616"
+
+plot_B <- ggplot(site_scores, aes(x = NMDS1, y = NMDS2)) +
+  geom_polygon(data = hulls, aes(fill = Status), alpha = 0.2) +
+  geom_point(aes(color = Status), size = 3) +
+  scale_color_manual(values = c(Invaded = gator_orange, Non_Invaded = gator_blue),
+                     labels = c(Invaded = "Invaded", Non_Invaded = "Non-Invaded")) +
+  scale_fill_manual(values = c(Invaded = gator_orange, Non_Invaded = gator_blue),
+                    labels = c(Invaded = "Invaded", Non_Invaded = "Non-Invaded")) +
+  labs(x = "NMDS Axis 1", y = "NMDS Axis 2") +
+  theme_bw() +
+  coord_equal()
+
+plot_C <- ggplot(site_scores, aes(x = NMDS1, y = NMDS2)) +
+  geom_point(aes(color = Avg_Cogongrass_Cover), size = 3, alpha = 0.8) +
+  scale_color_viridis_c(direction = -1) +
+  labs(x = "NMDS Axis 1", y = "NMDS Axis 2", color = "Cogongrass\nCover (%)") +
+  theme_bw() +
+  coord_equal()
+
+final_figure_BC <- plot_B + plot_C +
+  plot_layout(ncol = 2) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 12),
+        plot.tag.position = c(0.01, 0.99))
+
+final_figure_BC
+ggsave("Cogon_NMDS_Results.png", plot = final_figure_BC, width = 12, height = 10, dpi = 300)
+```
+
+## PERMANOVA
+```{r permanova}
+
+# --- Calculate Avg Cogongrass Cover per Plot ---
+avg_cogongrass_cover <- species_matrix %>%
+  group_by(Plot) %>%
+  summarize(Avg_Cogongrass_Cover = sum(Imperata_cylindrica, na.rm = TRUE) / n(), .groups = "drop")
+
+# --- Merge with CogonSites metadata ---
+plot_metadata <- CogonSites %>%
+  distinct(Plot, .keep_all = TRUE) %>%
+  left_join(avg_cogongrass_cover, by = "Plot") %>%
+  filter(Plot %in% species_matrix$Plot) %>%
+  arrange(match(Plot, species_matrix$Plot))  # align with species_matrix rows
+
+all(plot_metadata$Plot == species_matrix$Plot)
+
+# --- Bray-Curtis dissimilarity ---
+species_matrix_numeric <- species_matrix %>%
+  select(-Plot)  # exclude Plot column
+dist_matrix <- vegdist(species_matrix_numeric, method = "bray")
+
+# --- PERMANOVA ---
+set.seed(123)
+permanova_result <- adonis2(
+  dist_matrix ~ Avg_Cogongrass_Cover,
+  data = plot_metadata,
+  strata = plot_metadata$Site,
+  permutations = 999
+)
+
+print(permanova_result)
+```
+
+## Regional NMDS and PERMANOVA
+```{r regional_nmds_permanova}
+run_region_nmds <- function(region_sites,
+                            region_name,
+                            rarity_threshold = 0,
+                            k_dim = 4) {
+  
+  cat("\n=============================\n")
+  cat("Region:", region_name, "\n")
+  cat("Sites:", paste(region_sites, collapse = ", "), "\n")
+  cat("=============================\n")
+  
+  # -----------------------------
+  # Subset metadata
+  # -----------------------------
+  region_metadata <- CogonSites %>%
+    filter(Site %in% region_sites)
+  
+  if (nrow(region_metadata) < 5) {
+    cat("Too few plots in region. Skipping.\n")
+    return(NULL)
+  }
+  
+  # -----------------------------
+  # Filter raw datasets to region plots
+  # -----------------------------
+  region_plots <- region_metadata$Plot
+  
+  tree_region  <- tree_data  %>% filter(Plot %in% region_plots)
+  veg_region   <- Veg_Cover  %>% filter(Plot %in% region_plots)
+  shrub_region <- shrub_data %>% filter(Plot %in% region_plots)
+  ground_region <- ground_cover %>% filter(Plot %in% region_plots)
+  
+  # -----------------------------
+  # Create species matrix
+  # -----------------------------
+  region_species_matrix <- create_matrix_by_rarity(
+    rarity_threshold = rarity_threshold,
+    tree_data_raw = tree_region,
+    veg_cover_raw = veg_region,
+    shrub_data_raw = shrub_region,
+    ground_cover_raw = ground_region,
+    cogon_sites_raw = region_metadata,
+    quadrat_counts_df = quadrat_count
+    )
+
+  # -----------------------------
+  # NMDS
+  # -----------------------------
+  set.seed(123)
+  region_nmds <- metaMDS(region_species_matrix[, -1],
+                         distance = "bray",
+                         k = k_dim,
+                         trymax = 250,
+                         autotransform = FALSE,
+                         trace = 0)
+  
+  cat("Stress:", region_nmds$stress, "\n")
+  
+  # -----------------------------
+  # Extract site scores
+  # -----------------------------
+  site_scores <- as.data.frame(scores(region_nmds, "sites"))
+  site_scores$Plot <- region_species_matrix$Plot
+  
+  site_scores <- left_join(site_scores,
+                           region_metadata %>% distinct(Plot, .keep_all = TRUE),
+                           by = "Plot")
+  # -----------------------------
+  # PERMANOVA (continuous cover)
+  # -----------------------------
+  # Keep only plots that survived matrix filtering
+  valid_plots <- region_species_matrix$Plot
+  permanova_data <- region_metadata %>%
+    distinct(Plot, .keep_all = TRUE) %>%
+    filter(Plot %in% valid_plots) %>%
+    arrange(match(Plot, valid_plots))
+  
+  # Reorder species matrix to match metadata
+  region_species_matrix <- region_species_matrix %>%
+    filter(Plot %in% permanova_data$Plot) %>%
+    arrange(match(Plot, permanova_data$Plot))
+  
+  # Final safety check
+  stopifnot(all(permanova_data$Plot == region_species_matrix$Plot))
+  
+  # Create distance matrix
+  dist_matrix <- vegdist(region_species_matrix[, -1], method = "bray")
+  
+  # Run PERMANOVA
+  set.seed(123)
+  permanova_result <- adonis2(
+    dist_matrix ~ Imperata_cylindrica,
+    data = region_species_matrix,
+    permutations = 999
+    )
+  
+  print(permanova_result)
+  
+
+  return(list(
+    nmds = region_nmds,
+    site_scores = site_scores,
+    permanova = permanova_result
+  ))
+}
+```
+
+## Regional Groups
+```{r Regional_Groups}
+central_fl <- c("ONF", "WSF")
+north_fl   <- c("BRSF", "Escambia", "Jay", "Howell", "Hooper")
+south_ms   <- c("CNF", "DSNF", "BCNWR")
+```
+
+## Run Each Region
+```{r run_regions}
+central_results <- run_region_nmds(
+  region_sites = central_fl,
+  region_name = "Central FL"
+)
+
+north_results <- run_region_nmds(
+  region_sites = north_fl,
+  region_name = "North FL"
+)
+
+south_results <- run_region_nmds(
+  region_sites = south_ms,
+  region_name = "South MS"
+)
+```
+
+
+## Central Florida Ordination Plot
+```{r central_florida_ordination}
+hulls_cf <- central_results$site_scores %>%
+  group_by(Status) %>%
+  slice(chull(NMDS1, NMDS2))
+
+ggplot(central_results$site_scores,
+       aes(x = NMDS1, y = NMDS2)) +
+  geom_polygon(data = hulls_cf,
+               aes(fill = Status),
+               alpha = 0.2) +
+  geom_point(aes(color = Status), size = 3) +
+  theme_bw() +
+  coord_equal() +
+  labs(
+    title = "Central Florida NMDS",
+    subtitle = paste("Stress =", round(central_results$nmds$stress, 3))
+  )
+```
+
+## North Florida Ordination Plot
+```{r north_florida_ordination}
+hulls_nf <- north_results$site_scores %>%
+  group_by(Status) %>%
+  slice(chull(NMDS1, NMDS2))
+
+ggplot(north_results$site_scores,
+       aes(x = NMDS1, y = NMDS2)) +
+  geom_polygon(data = hulls_nf,
+               aes(fill = Status),
+               alpha = 0.2) +
+  geom_point(aes(color = Status), size = 3) +
+  theme_bw() +
+  coord_equal() +
+  labs(
+    title = "North Florida NMDS",
+    subtitle = paste("Stress =", round(north_results$nmds$stress, 3))
+  )
+```
+
+
+## South Mississippi Ordination Plot
+```{r south_mississippi_ordination}
+hulls_sm <- south_results$site_scores %>%
+  group_by(Status) %>%
+  slice(chull(NMDS1, NMDS2))
+
+ggplot(south_results$site_scores,
+       aes(x = NMDS1, y = NMDS2)) +
+  geom_polygon(data = hulls_sm,
+               aes(fill = Status),
+               alpha = 0.2) +
+  geom_point(aes(color = Status), size = 3) +
+  theme_bw() +
+  coord_equal() +
+  labs(
+    title = "South Mississippi NMDS",
+    subtitle = paste("Stress =", round(south_results$nmds$stress, 3))
+  )
+  
+```
+
+## Patchwork
+combine the three regional NMDS plots into a single figure
+```{r regional_patchwork}
+make_region_plot <- function(results_object, region_title, x_range, y_range) {
+  
+  hulls <- results_object$site_scores %>%
+    group_by(Status) %>%
+    slice(chull(NMDS1, NMDS2))
+  
+  ggplot(results_object$site_scores,
+         aes(x = NMDS1, y = NMDS2)) +
+    geom_polygon(data = hulls,
+                 aes(fill = Status),
+                 alpha = 0.2) +
+    geom_point(aes(color = Status), size = 3) +
+    scale_color_manual(
+      values = c(
+        Invaded     = "#D55E00",
+        Non_Invaded = "#0072B2"
+      ),
+      labels = c(
+        Invaded     = "Invaded",
+        Non_Invaded = "Non-Invaded"
+      )
+    ) +
+    scale_fill_manual(
+      values = c(
+        Invaded     = "#D55E00",
+        Non_Invaded = "#0072B2"
+      ),
+      labels = c(
+        Invaded     = "Invaded",
+        Non_Invaded = "Non-Invaded"
+      )
+    ) +
+    coord_fixed(xlim = x_range, ylim = y_range) +
+    theme_bw(base_size = 12) +
+    labs(
+      title    = region_title,
+      subtitle = paste("Stress =", round(results_object$nmds$stress, 3)),
+      x        = "NMDS1",
+      y        = "NMDS2",
+      color    = "Status",
+      fill     = "Status"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold")
+    )
+}
+
+# Compute shared axis limits across all three regions
+all_scores <- bind_rows(
+  central_results$site_scores,
+  north_results$site_scores,
+  south_results$site_scores
+)
+
+x_range <- range(all_scores$NMDS1) * 1.05
+y_range <- range(all_scores$NMDS2) * 1.05
+
+plot_cf <- make_region_plot(central_results, "A)", x_range, y_range)
+plot_nf <- make_region_plot(north_results,   "B)", x_range, y_range)
+plot_sm <- make_region_plot(south_results,   "C)", x_range, y_range)
+
+final_region_figure <- (plot_cf / plot_nf / plot_sm) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+ggsave("Regional_NMDS_Comparison.png",
+       final_region_figure,
+       width  = 8,
+       height = 14,
+       dpi    = 600)
+```
