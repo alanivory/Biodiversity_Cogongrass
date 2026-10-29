@@ -1,0 +1,868 @@
+---
+title: "Reworked Biodiversity Prediction"
+author: "Ann."
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+pacman::p_load(tidyverse, terra, tidyterra, sf, viridis, patchwork, elevatr, randomForest, maps)
+
+## Load Fitted RF Model
+rf_final <- readRDS("shannon_diversity_spatial_rf_model.rds")
+```
+
+
+## Load and Prepare Data
+```{r load-data}
+model_vars <- attr(rf_final$terms, "term.labels")
+cat("Model expects these predictors:\n")
+print(model_vars)
+
+# Separate env vs MEM vars as before
+env_vars <- model_vars[!grepl("^MEM", model_vars)]
+mem_vars  <- model_vars[ grepl("^MEM", model_vars)]
+cat(sprintf("\nEnvironmental predictors : %s\n", paste(env_vars, collapse = ", ")))
+cat(sprintf("MEM predictors (→ set 0) : %s\n\n", paste(mem_vars, collapse = ", ")))
+```
+
+## NLCD
+```{r nlcd, eval=FALSE, include=FALSE}
+nlcd <- rast("I:/Cogongrass_Project/data/nlcd/Annual_NLCD_LndCov_2024_CU_C1V1.tif")
+
+# NLCD Lookup table
+nlcd_table <- data.frame(
+  value = c(11,12,21,22,23,24,31,41,42,43,51,52,71,72,73,74,81,82,90,95),
+  class = c(
+    "Open Water", "Perennial Ice/Snow",
+    "Developed Open", "Developed Low", "Developed Medium", "Developed High",
+    "Barren",
+    "Deciduous Forest", "Evergreen Forest", "Mixed Forest",
+    "Dwarf Scrub", "Shrub/Scrub",
+    "Grassland", "Sedge", "Lichens", "Moss",
+    "Pasture/Hay", "Cultivated Crops",
+    "Woody Wetlands", "Emergent Wetlands"
+  )
+)
+
+levels(nlcd) <- nlcd_table
+plot(nlcd)
+```
+
+```{r elevation, eval=FALSE, include=FALSE}
+conus_bbox <- st_bbox(c(
+  xmin = -125,
+  xmax = -66,
+  ymin = 24,
+  ymax = 50
+), crs = st_crs(4326))
+
+conus <- st_as_sf(st_as_sfc(conus_bbox))
+
+dem <- get_elev_raster(
+  locations = conus,
+  z = 5,
+  clip = "locations"
+)
+
+dem <- rast(dem)
+plot(dem)
+
+writeRaster(dem,
+"I:/Cogongrass_Project/data/Topography/Elevation_CONUS.tif",
+overwrite = TRUE)
+
+```
+
+```{r treeC, eval=FALSE, include=FALSE}
+# Set folder containing exported tiles
+treeC_files <- list.files("NLCD_Tree_Cover/",
+                    pattern = ".tif$",
+                    full.names = TRUE)
+
+# Read tiles
+treeC_rasters <- lapply(treeC_files, rast)
+
+# Merge into one raster
+treeC <- do.call(merge, treeC_rasters)
+
+# Save as single tif
+writeRaster(treeC,
+            "Tree_Cover_SE.tif",
+            overwrite = TRUE)
+
+plot(treeC, main = "Merged Tree Cover Raster")
+```
+
+
+```{r soils, eval=FALSE, include=FALSE}
+# -----------------------------------------------------------------------------
+# Soils Data
+# -----------------------------------------------------------------------------
+gdb_path   <- "I:/Cogongrass_Project/data/Soils/gSSURGO_CONUS.gdb"
+out_dir    <- "I:/Cogongrass_Project/data/Soils/taxorder_tiles"
+out_final  <- "I:/Cogongrass_Project/data/Soils/taxorder_CONUS_30m.tif"
+n_tiles_x  <- 10
+n_tiles_y  <- 10
+
+# -----------------------------------------------------------------------------
+# Lookup Table
+# -----------------------------------------------------------------------------
+cat("Building lookup...\n")
+dc   <- st_read(gdb_path, layer = "DominantComponent", quiet = TRUE)
+comp <- st_read(gdb_path, layer = "component", quiet = TRUE) |> select(cokey, taxorder)
+
+lookup <- dc |>
+  left_join(comp, by = "cokey") |>
+  select(mukey, taxorder) |>
+  mutate(
+    mukey = as.integer(mukey),
+    taxorder_int = case_when(
+      taxorder == "Alfisols"    ~ 1L,
+      taxorder == "Andisols"    ~ 2L,
+      taxorder == "Aridisols"   ~ 3L,
+      taxorder == "Entisols"    ~ 4L,
+      taxorder == "Gelisols"    ~ 5L,
+      taxorder == "Histosols"   ~ 6L,
+      taxorder == "Inceptisols" ~ 7L,
+      taxorder == "Mollisols"   ~ 8L,
+      taxorder == "Spodosols"   ~ 9L,
+      taxorder == "Ultisols"    ~ 10L,
+      taxorder == "Vertisols"   ~ 11L,
+      TRUE                      ~ NA_integer_
+    )
+  )
+rm(dc, comp); gc()
+cat("Lookup built:", nrow(lookup), "mukeys\n")
+
+# -----------------------------------------------------------------------------
+# Raster Dimensions
+# -----------------------------------------------------------------------------
+r_tmp      <- rast(gdb_path)
+total_nrow <- nrow(r_tmp)
+total_ncol <- ncol(r_tmp)
+r_ext      <- as.vector(ext(r_tmp))   # xmin, xmax, ymin, ymax
+r_res      <- res(r_tmp)
+r_crs      <- crs(r_tmp)
+rm(r_tmp); gc()
+
+tile_nrow  <- ceiling(total_nrow / n_tiles_y)
+tile_ncol  <- ceiling(total_ncol / n_tiles_x)
+cat(sprintf("Raster: %d x %d | Tile size: %d x %d\n",
+            total_nrow, total_ncol, tile_nrow, tile_ncol))
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------------------------------------------------------------
+# Process tile function
+# -----------------------------------------------------------------------------
+process_tile <- function(tile_ix, tile_iy, gdb_path, lookup, out_dir,
+                         tile_nrow, tile_ncol, total_nrow, total_ncol,
+                         r_ext, r_res, r_crs) {
+
+  tile_id  <- sprintf("tile_%02d_%02d", tile_iy, tile_ix)
+  out_tile <- file.path(out_dir, paste0(tile_id, ".tif"))
+
+  if (file.exists(out_tile)) {
+    cat(sprintf("  [%s] Already exists, skipping.\n", tile_id))
+    return(out_tile)
+  }
+
+  # Row/col bounds
+  row_start <- (tile_iy - 1) * tile_nrow + 1
+  col_start <- (tile_ix - 1) * tile_ncol + 1
+  row_end   <- min(row_start + tile_nrow - 1, total_nrow)
+  col_end   <- min(col_start + tile_ncol - 1, total_ncol)
+
+  cat(sprintf("  [%s] rows %d-%d, cols %d-%d...\n",
+              tile_id, row_start, row_end, col_start, col_end))
+
+  # Convert row/col to spatial extent
+  xmin_tile <- r_ext[1] + (col_start - 1) * r_res[1]
+  xmax_tile <- r_ext[1] +  col_end        * r_res[1]
+  ymax_tile <- r_ext[4] - (row_start - 1) * r_res[2]
+  ymin_tile <- r_ext[4] -  row_end        * r_res[2]
+
+  tile_ext <- ext(xmin_tile, xmax_tile, ymin_tile, ymax_tile)
+
+  r_src  <- rast(gdb_path)
+  tile_r <- crop(r_src, tile_ext)
+  rm(r_src)
+
+  # Extract mukey values
+  mukey_vals <- values(tile_r, dataframe = FALSE, mat = FALSE)
+  if (is.character(mukey_vals)) mukey_vals <- suppressWarnings(as.integer(mukey_vals))
+
+  # Reclassify
+  taxorder_int <- lookup$taxorder_int[match(mukey_vals, lookup$mukey)]
+
+  # Build output raster
+  tile_out <- rast(nrows = nrow(tile_r), ncols = ncol(tile_r),
+                   ext = ext(tile_r), crs = r_crs)
+  values(tile_out) <- taxorder_int
+
+  writeRaster(tile_out, filename = out_tile, datatype = "INT1U",
+              gdal = c("COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES",
+                       "BLOCKXSIZE=512", "BLOCKYSIZE=512"),
+              overwrite = TRUE, NAflag = 255L)
+
+  rm(tile_r, tile_out, mukey_vals, taxorder_int); gc()
+  return(out_tile)
+}
+
+# -----------------------------------------------------------------------------
+# Tile Loop
+# -----------------------------------------------------------------------------
+cat("\n=== STARTING TILE PROCESSING ===\n")
+t_start    <- proc.time()
+tile_files <- character(n_tiles_x * n_tiles_y)
+k <- 1
+
+for (iy in 1:n_tiles_y) {
+  for (ix in 1:n_tiles_x) {
+    cat(sprintf("\nTile [%d/%d] (row-tile %d, col-tile %d)\n",
+                k, n_tiles_x * n_tiles_y, iy, ix))
+    tile_files[k] <- process_tile(
+      tile_ix    = ix,   tile_iy    = iy,
+      gdb_path   = gdb_path,        lookup     = lookup,
+      out_dir    = out_dir,         tile_nrow  = tile_nrow,
+      tile_ncol  = tile_ncol,       total_nrow = total_nrow,
+      total_ncol = total_ncol,      r_ext      = r_ext,
+      r_res      = r_res,           r_crs      = r_crs
+    )
+    k <- k + 1
+    if (k %% 10 == 0) {
+      elapsed <- (proc.time() - t_start)["elapsed"]
+      cat(sprintf("  --> %d/%d done | %.1f min elapsed | ~%.1f min remaining\n",
+                  k - 1, n_tiles_x * n_tiles_y, elapsed / 60,
+                  (elapsed / (k - 1)) * (n_tiles_x * n_tiles_y - k + 1) / 60))
+    }
+  }
+}
+cat(sprintf("\nAll tiles done in %.1f min.\n",
+            (proc.time() - t_start)["elapsed"] / 60))
+# -----------------------------------------------------------------------------
+# Mosaic Via VRT
+# -----------------------------------------------------------------------------
+cat("\nBuilding VRT mosaic...\n")
+vrt_path <- file.path(out_dir, "taxorder_mosaic.vrt")
+vrt_r    <- vrt(tile_files, vrt_path, overwrite = TRUE)
+cat("VRT built OK\n")
+
+cat("\nWriting final GeoTIFF (may take 20-40 min)...\n")
+writeRaster(
+  vrt_r,
+  filename  = out_final,
+  datatype  = "INT1U",
+  gdal      = c("COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES",
+                "BLOCKXSIZE=512", "BLOCKYSIZE=512", "BIGTIFF=YES"),
+  overwrite = TRUE,
+  NAflag    = 255L
+)
+cat("Final raster written to:", out_final, "\n")
+
+# -----------------------------------------------------------------------------
+# Verify Output & Print
+# -----------------------------------------------------------------------------
+order_levels <- c("Alfisols","Andisols","Aridisols","Entisols","Gelisols",
+                  "Histosols","Inceptisols","Mollisols","Spodosols","Ultisols","Vertisols")
+
+cat("\n=== VERIFICATION ===\n")
+r_out <- rast(out_final)
+print(r_out)
+
+cat("\nCell counts by taxonomic order:\n")
+freq_tbl <- freq(r_out)
+freq_tbl$taxorder <- order_levels[match(freq_tbl$value, 1:11)]
+freq_tbl$area_km2 <- round(freq_tbl$count * 30 * 30 / 1e6, 1)
+print(freq_tbl[, c("value", "taxorder", "count", "area_km2")])
+
+# Load the raster
+r_out <- rast("I:/Cogongrass_Project/data/Soils/taxorder_CONUS_30m.tif")
+
+# Define labels and colors
+order_levels <- c("Alfisols","Andisols","Aridisols","Entisols","Gelisols",
+                  "Histosols","Inceptisols","Mollisols","Spodosols","Ultisols","Vertisols")
+
+order_colors <- c(
+  "#E41A1C", "#377EB8", "#FF7F00", "#4DAF4A", "#984EA3",
+  "#A65628", "#F781BF", "#FFFF33", "#1B9E77", "#D95F02", "#7570B3"
+)
+
+# Assign factor levels to raster
+levels(r_out) <- data.frame(ID = 1:11, taxorder = order_levels)
+
+# Plot
+ggplot() +
+  geom_spatraster(data = r_out) +
+  scale_fill_manual(
+    values  = setNames(order_colors, order_levels),
+    na.value = "white",
+    name    = "Soil Order"
+  ) +
+  coord_sf() +
+  theme_minimal() +
+  labs(title = "CONUS Soil Taxonomic Order (gSSURGO, 30m)")
+```
+
+```{r raster_stack}
+# After building env_vars, exclude Cogongrass_Cover since it's not a raster predictor but a fixed value in scenarios
+env_vars <- env_vars[env_vars != "Cogongrass_Cover"]
+
+raster_paths <- list(
+  pr              = "5_Year_Average_Precipitation.tif",
+  sph             = "5_Year_Average_Specific_Humidity.tif",
+  srad            = "5_Year_Average_Radiation.tif",
+  TreeCanopy_NLCD = "Tree_Cover_SE.tif",
+  ndvi            = "CombinedMedianNDVI.tif",
+  tmmn            = "5_Year_Average_Min_Temperature.tif",
+  elevation       = "Elevation_CONUS.tif",
+  SoilType        = "taxorder_CONUS_30m 1.tif",
+  avg_pop_den_1km = "US_PopDensity_2020.tif",
+  nlcd            = "Annual_NLCD_LndCov_2024_CU_C1V1.tif"
+)
+
+missing_rasts <- setdiff(env_vars, names(raster_paths))
+if (length(missing_rasts) > 0) {
+  stop(sprintf("Missing raster paths for: %s", paste(missing_rasts, collapse = ", ")))
+}
+
+## Load only the needed rasters
+cat("Loading rasters...\n")
+rast_list <- lapply(env_vars, function(v) {
+  cat(sprintf("  Loading: %s\n", v))
+  rast(raster_paths[[v]])
+})
+names(rast_list) <- env_vars
+
+# Loop through and plot each raster
+for (name in names(raster_paths)) {
+  
+  r <- rast(raster_paths[[name]])
+  
+  plot(r, main = name)
+}
+```
+
+## Align Rasters
+```{r align-rasters}
+# --- Check what CRS the rasters are in ---
+cat("CRS of each raster:\n")
+for (v in names(rast_list)) {
+  cat(sprintf("  %-20s %s\n", v, crs(rast_list[[v]], describe = TRUE)$code))
+}
+
+# --- Use NDVI raster extent as the boundary ---
+cat("\nExtracting extent from NDVI raster...\n")
+ndvi_rast     <- rast(raster_paths[["ndvi"]])
+ndvi_crs      <- crs(ndvi_rast)
+ndvi_extent   <- ext(ndvi_rast)
+
+cat(sprintf("NDVI CRS:    %s\n", crs(ndvi_rast, describe = TRUE)$code))
+cat("NDVI Extent:\n")
+print(ndvi_extent)
+
+# --- Load, crop each raster to NDVI extent ---
+local_dir <- "C:/local_cache"
+dir.create(local_dir, showWarnings = FALSE, recursive = TRUE)
+
+rast_list <- lapply(names(raster_paths), function(v) {
+  src_path   <- raster_paths[[v]]
+  local_path <- file.path(local_dir, paste0(v, ".tif"))
+
+  if (!file.exists(local_path)) {
+    cat(sprintf("  Copying %-20s to local cache...\n", v))
+    r_src <- rast(src_path)
+    writeRaster(r_src, local_path, overwrite = TRUE)
+  }
+
+  r <- rast(local_path)
+
+  # Reproject the NDVI extent into this raster's CRS for cropping
+  if (!same.crs(r, ndvi_rast)) {
+    ndvi_ext_reproj <- ext(project(vect(ndvi_extent, crs = ndvi_crs), crs(r)))
+  } else {
+    ndvi_ext_reproj <- ndvi_extent
+  }
+
+  r_crop <- crop(r, ndvi_ext_reproj)
+
+  cat(sprintf("  %-20s done | dims: %d x %d | CRS: %s\n",
+              v, nrow(r_crop), ncol(r_crop),
+              crs(r_crop, describe = TRUE)$code))
+  r_crop
+})
+names(rast_list) <- names(raster_paths)
+
+```
+
+## Env Stack for Prediction
+I will change ref_rast to pr for now, to make predictions at the 4km scale. I can switch back to ndvi if we decide 30 m resolution is needed. Because weather data is at 4km, weather pixels become roughly 17,000 identical pixels.
+
+```{r env-stack}
+# Use the NDVI raster as the reference grid for alignment
+ref_rast <- rast_list[["ndvi"]] 
+
+cat("Aligning all rasters to the NDVI 30m reference grid...\n")
+cat("\nReprojecting and resampling TreeCanopy and SoilType to match ref grid...\n")
+
+rast_aligned <- lapply(names(rast_list), function(v) {
+  r <- rast_list[[v]]
+  
+  # Define categorical layers that must use Nearest Neighbor
+  categorical_layers <- c("SoilType", "nlcd")
+  method <- if (v %in% categorical_layers) "near" else "bilinear"
+  
+  if (!same.crs(r, ref_rast)) {
+    cat(sprintf("  Reprojecting: %s to 30m...\n", v))
+    r <- project(r, ref_rast, method = method)
+  } else if (!compareGeom(r, ref_rast, stopOnError = FALSE)) {
+    cat(sprintf("  Resampling:   %s to 30m...\n", v))
+    r <- resample(r, ref_rast, method = method)
+  } else {
+    cat(sprintf("  Already Aligned: %s\n", v))
+  }
+  r
+})
+
+names(rast_aligned) <- names(rast_list)
+
+env_stack <- rast(rast_aligned)
+names(env_stack) <- names(rast_aligned)
+cat(sprintf("\nenv_stack: %d layers, %d x %d cells\n",
+            nlyr(env_stack), nrow(env_stack), ncol(env_stack)))
+
+# Check for NaN/NA in each layer
+cat("\nNon-NA cell counts per layer:\n")
+for (v in names(env_stack)) {
+  n <- global(env_stack[[v]], fun = "notNA")[1,1]
+  cat(sprintf("  %-20s %d\n", v, n))
+}
+```
+
+## NLCD Masking
+Only focus on forest, shrubland, or herbaceous areas
+NLCD Classes: 41, 42, 43 (Forests); 52 (Shrub); 71 (Herbaceous); 90 (Woody Wetland); 95 (Emergent Wetland)
+```{r nlcd-mask}
+mask_habitats <- function(env_stack, nlcd_raster) {
+  cat("Masking landscape to Forest, Shrubland, and Herbaceous cover...\n")
+  
+  # Align NLCD to the stack
+  if(!compareGeom(nlcd_raster, env_stack, stopOnError = FALSE)) {
+    nlcd_raster <- project(nlcd_raster, env_stack, method = "near")
+  }
+  
+  # Define target classes
+  target_classes <- c(41, 42, 43, 52, 71, 90, 95)
+  mask_layer <- nlcd_raster %in% target_classes
+  mask_layer[mask_layer == 0] <- NA
+  
+  # Apply mask to the entire stack
+  env_stack_masked <- mask(env_stack, mask_layer)
+  return(env_stack_masked)
+}
+
+env_stack <- mask_habitats(env_stack, rast_list[["nlcd"]])
+```
+
+
+## Predict Function
+```{r predict-function}
+# Takes a cogongrass cover value, builds predictor dataframe,
+# sets MEMs to 0, predicts, returns a raster (If you use MEMs)
+
+predict_diversity <- function(cogongrass_value, env_stack, rf_model, mem_vars) {
+  cat(sprintf("  Predicting at Cogongrass_Cover = %d%%...\n", cogongrass_value))
+
+  # Convert stack to data frame
+  pred_df <- as.data.frame(env_stack, xy = FALSE, na.rm = FALSE)
+  
+  # Only predict for cells that aren't NA (masked out by NLCD or missing data)
+  valid_cells <- complete.cases(pred_df)
+  
+  if(sum(valid_cells) == 0) stop("No valid cells found for prediction. Check NLCD mask.")
+
+  # Build scenario data
+  pred_df$Cogongrass_Cover <- cogongrass_value
+  for (mem in mem_vars) pred_df[[mem]] <- 0 # MEMs held constant at 0
+
+  all_vars <- attr(rf_model$terms, "term.labels")
+  pred_df_valid <- pred_df[valid_cells, all_vars, drop = FALSE]
+
+  # Generate predictions
+  predicted_vals <- predict(rf_model, newdata = pred_df_valid)
+
+  # Map values back to raster space
+  predicted_full <- rep(NA_real_, nrow(pred_df))
+  predicted_full[valid_cells] <- predicted_vals
+
+  result_rast <- env_stack[[1]]
+  values(result_rast) <- predicted_full
+  names(result_rast) <- paste0("Shannon_", cogongrass_value)
+  
+  return(result_rast)
+}
+```
+
+## Run Cogongrass Scenarios
+```{r run-scenarios}
+scenario_levels <- seq(0, 100, by = 1)
+prediction_list <- list()
+
+cat("\n========== Running All Cogongrass Scenarios ==========\n")
+for(level in scenario_levels) {
+  prediction_list[[paste0("p", level)]] <- predict_diversity(level, env_stack, rf_final, mem_vars)
+}
+
+baseline <- prediction_list[["p0"]]
+diff_list <- list()
+
+cat("\nCalculating differences relative to 0% baseline...\n")
+for(level in scenario_levels[-1]) { # Skip 0
+  diff_name <- paste0("Diff_", level, "_vs_0")
+  diff_list[[diff_name]] <- prediction_list[[paste0("p", level)]] - baseline
+  
+  # Save result
+  writeRaster(diff_list[[diff_name]], paste0(diff_name, ".tif"), overwrite = TRUE)
+}
+```
+
+## Summary Statisitics Table
+```{r summary-table}
+cat("\n========== Scenario Summary Statistics (Relative to Baseline) ==========\n")
+stats_summary <- lapply(names(diff_list), function(nm) {
+  v <- values(diff_list[[nm]], na.rm = TRUE)
+  data.frame(
+    Scenario = nm,
+    Mean_Change = mean(v),
+    Max_Loss = min(v),
+    Max_Gain = max(v)
+  )
+}) %>% bind_rows()
+
+print(stats_summary)
+```
+
+## Plot
+```{r Visual}
+plot_raster <- function(rast_layer, title = NULL, subtitle = NULL,
+                        palette = "viridis", midpoint = NULL,
+                        low = NULL, high = NULL, mid = NULL,
+                        limits = NULL) {
+  
+  df <- as.data.frame(rast_layer, xy = TRUE)
+  colnames(df)[3] <- "value"
+  df <- df[!is.na(df$value), ]
+  
+  x_range <- range(df$x, na.rm = TRUE)
+  y_range <- range(df$y, na.rm = TRUE)
+  buf <- 0.5
+  
+  p <- ggplot() +
+    geom_raster(data = df, aes(x = x, y = y, fill = value)) +
+    geom_sf(data = states_sf, fill = NA, colour = "grey30", linewidth = 0.3) +
+    coord_sf(
+      xlim = c(x_range[1] - buf, x_range[2] + buf),
+      ylim = c(y_range[1] - buf, y_range[2] + buf)
+    ) +
+    labs(title = title, subtitle = subtitle, x = NULL, y = NULL) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "right",
+          axis.text = element_text(size = 8))
+  
+  if (!is.null(midpoint)) {
+    p <- p + scale_fill_gradient2(
+      low = low, mid = mid, high = high,
+      midpoint = midpoint,
+      limits = limits,
+      name = "ΔShannon",
+      na.value = "transparent"
+    )
+  } else {
+    p <- p + scale_fill_viridis_c(
+      option = palette,
+      limits = limits,
+      name = "Shannon\nDiversity",
+      na.value = "transparent"
+    )
+  }
+  
+  return(p)
+}
+
+se_states <- c("Florida", "Georgia", "Alabama", "Mississippi", "South Carolina",
+               "North Carolina", "Tennessee", "Arkansas", "Louisiana", "Virginia")
+
+states_sf <- maps::map("state", fill = TRUE, plot = FALSE) %>%
+             st_as_sf()
+
+p_final <- plot_raster(diff_list[["Diff_100_vs_0"]],
+                       midpoint = 0,
+                       low = "#d73027", mid = "white", high = "#1a9850")
+
+# To see it:
+print(p_final)
+
+ggsave("cogongrass_cover_100pct.png", p_final, width = 8, height = 6, dpi = 300)
+```
+
+## Patchwork
+```{r patchwork}
+# Shared color limit
+all_vals <- unlist(lapply(seq(10, 100, by = 10), function(pct) {
+  key <- paste0("Diff_", pct, "_vs_0")
+  if (!is.null(diff_list[[key]])) {
+    vals <- values(diff_list[[key]], na.rm = TRUE)
+    return(vals)
+  }
+}))
+max_abs <- max(abs(all_vals), na.rm = TRUE)
+shared_limits <- c(-max_abs, max_abs)
+
+cover_pcts <- seq(10, 100, by = 10)
+
+plots <- lapply(cover_pcts, function(pct) {
+  key <- paste0("Diff_", pct, "_vs_0")
+  
+  plot_raster(
+    diff_list[[key]],
+    title  = paste0(pct, "%"),
+    midpoint = 0,
+    low    = "#d73027", mid = "white", high = "#1a9850",
+    limits = shared_limits
+  ) +
+  theme(
+    axis.text  = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = if (pct == 100) "right" else "none"
+  )
+})
+
+
+p_patch <- wrap_plots(plots, ncol = 5) +
+  plot_annotation(
+    title   = "Predicted Biodiversity Impact by Cogongrass Cover",
+    subtitle = "ΔShannon relative to 0% baseline"
+  )
+
+print(p_patch)
+
+ggsave("cogongrass_cover_patchwork.png", p_patch,
+       width = 20, height = 9, dpi = 300)
+```
+
+## Additional Analysis
+```{r additional-analysis}
+## Area-Based Impact
+v <- values(diff_list[["Diff_100_vs_0"]])
+
+prop_loss <- mean(v < 0, na.rm = TRUE)
+prop_gain <- mean(v > 0, na.rm = TRUE)
+
+## Threshold Mapping
+severe_loss <- diff_list[["Diff_100_vs_0"]] < -0.7
+plot(severe_loss, main = "Areas with Severe Predicted Loss (>0.7 decrease)")
+
+# Regional Summaries
+states_vect <- terra::vect(states_sf)
+
+regional_summary <- lapply(names(diff_list), function(nm) {
+  
+  r <- diff_list[[nm]]
+  
+  vals <- terra::extract(r, states_vect, fun = mean, na.rm = TRUE)
+  
+  vals$State <- states_sf$ID[vals$ID]
+  
+  vals$Scenario <- nm
+  vals
+  
+}) %>% bind_rows()
+
+
+regional_summary$Scenario_num <- as.numeric(gsub("Diff_|_vs_0", "", regional_summary$Scenario))
+
+regional_summary$Scenario_num <- as.numeric(gsub("Diff_|_vs_0", "", regional_summary$Scenario))
+
+regional_long <- regional_summary %>%
+  pivot_longer(
+    cols = starts_with("Shannon_"),
+    names_to = "Replicate",
+    values_to = "Mean_Change"
+  ) %>%
+  filter(!is.na(Mean_Change))
+
+print(regional_long)
+
+ggplot(regional_long, aes(x = Scenario_num, y = Mean_Change, color = State)) +
+  geom_line() +
+  theme_bw() +
+  labs(x = "Cogongrass Cover (%)",
+       y = "Δ Shannon Diversity",
+       color = "State")
+
+## Subset regional_long for 100% scenario
+regional_100 <- regional_long %>%
+  filter(Scenario_num == 100)
+
+```
+
+## EPA Ecoregions
+```{r ecoregions}
+
+eco_l2 <- st_read("NA_CEC_Eco_Level2.shp") %>% st_transform(crs(diff_list[[1]]))
+eco_l3 <- st_read("NA_CEC_Eco_Level3.shp") %>% st_transform(crs(diff_list[[1]]))
+
+eco_l2_vect <- terra::vect(eco_l2)
+eco_l3_vect <- terra::vect(eco_l3)
+
+summarize_by_ecoregion <- function(diff_list, eco_vect, name_col) {
+  
+  template_raster <- diff_list[[1]]
+  
+  eco_rast <- terra::rasterize(eco_vect, template_raster, field = name_col)
+  
+  lapply(names(diff_list), function(nm) {
+    
+    r <- diff_list[[nm]]
+    
+    z <- terra::zonal(r, eco_rast, fun = "mean", na.rm = TRUE)
+    
+    colnames(z) <- c("Ecoregion", "Mean_Change")
+    z$Scenario <- nm
+    
+    z
+    
+  }) %>%
+    bind_rows() %>%
+    filter(!is.na(Mean_Change)) %>%
+    mutate(
+      Scenario_num = as.numeric(gsub("Diff_|_vs_0", "", Scenario))
+    )
+}
+
+
+eco_l2_summary <- summarize_by_ecoregion(diff_list, eco_l2_vect, name_col = "NA_L2NAME")
+eco_l3_summary <- summarize_by_ecoregion(diff_list, eco_l3_vect, name_col = "NA_L3NAME")
+
+plot_eco_response <- function(summary_df, ecoregion_col = "Ecoregion",
+                               title = NULL, ncol_legend = 1) {
+  ggplot(summary_df, aes(x = Scenario_num, y = Mean_Change,
+                          color = .data[[ecoregion_col]])) +
+    geom_line(linewidth = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    scale_x_continuous(breaks = seq(10, 100, 10)) +
+    theme_bw(base_size = 12) +
+    labs(
+      title   = title,
+      x       = "Cogongrass Cover (%)",
+      y       = "Δ Shannon Diversity",
+      color   = NULL
+    ) +
+    guides(color = guide_legend(ncol = ncol_legend))
+}
+
+p_l2 <- plot_eco_response(eco_l2_summary, title = "EPA Level 2 Ecoregions")
+p_l3 <- plot_eco_response(eco_l3_summary, title = "EPA Level 3 Ecoregions", ncol_legend = 2)
+
+print(p_l2)
+print(p_l3)
+
+plot_eco_100 <- function(summary_df, title = NULL) {
+  summary_df %>%
+    filter(Scenario_num == 100) %>%
+    mutate(Ecoregion = reorder(Ecoregion, Mean_Change)) %>%
+    ggplot(aes(x = Mean_Change, y = Ecoregion, fill = Mean_Change)) +
+      geom_col() +
+      geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+      scale_fill_gradient2(low = "#d73027", mid = "white", high = "#1a9850",
+                           midpoint = 0, guide = "none") +
+      theme_bw(base_size = 12) +
+      labs(title = title, x = "Δ Shannon Diversity (100% cover)", y = NULL)
+}
+
+p_l2_100 <- plot_eco_100(eco_l2_summary, title = "EPA Level 2 — 100% Cogongrass")
+p_l3_100 <- plot_eco_100(eco_l3_summary, title = "EPA Level 3 — 100% Cogongrass")
+
+print(p_l2_100)
+print(p_l3_100)
+
+
+```
+
+## US Ecoregion Extent- L2
+```{r ecoregion-extent_L2}
+eco_l2_100 <- eco_l2_summary %>%
+  dplyr::filter(Scenario_num == 100)
+
+eco_l2_map <- eco_l2 %>%
+  dplyr::left_join(eco_l2_100, by = c("NA_L2NAME" = "Ecoregion"))
+
+eco_l2_map_vect <- terra::vect(eco_l2_map)
+
+template_raster <- diff_list[[1]]
+
+eco_l2_map_vect <- terra::crop(eco_l2_map_vect, template_raster)
+
+terra::plot(
+  eco_l2_map_vect,
+  "Mean_Change",
+  col = hcl.colors(50, "RdYlGn", rev = TRUE),
+  main = "Δ Shannon Diversity (Level 2 Ecoregions, 100% Cogongrass)"
+)
+
+ggplot(eco_l2_map) +
+  geom_sf(aes(fill = Mean_Change), color = "black", linewidth = 0.2) +
+  scale_fill_gradient2(
+    low = "#d73027",
+    mid = "white",
+    high = "#1a9850",
+    midpoint = 0
+  ) +
+  theme_bw() +
+  labs(
+    title = "Δ Shannon Diversity (Level 2 Ecoregions, 100% Cogongrass)",
+    fill = "Change"
+  )
+```
+
+
+## US Ecoregion Extent- L3
+```{r ecoregion-extent_L3}
+eco_l3_100 <- eco_l3_summary %>%
+  dplyr::filter(Scenario_num == 100)
+
+eco_l3_map <- eco_l3 %>%
+  dplyr::left_join(eco_l3_100, by = c("NA_L3NAME" = "Ecoregion"))
+
+eco_l3_map_vect <- terra::vect(eco_l3_map)
+
+template_raster <- diff_list[[1]]
+
+eco_l3_map_vect <- terra::crop(eco_l3_map_vect, template_raster)
+
+terra::plot(
+  eco_l3_map_vect,
+  "Mean_Change",
+  col = hcl.colors(50, "RdYlGn", rev = TRUE),
+  main = "Δ Shannon Diversity (100% Cogongrass)"
+)
+
+ggplot(eco_l3_map) +
+  geom_sf(aes(fill = Mean_Change), color = NA) +
+  scale_fill_gradient2(
+    low = "#d73027",
+    mid = "white",
+    high = "#1a9850",
+    midpoint = 0
+  ) +
+  theme_bw() +
+  labs(
+    title = "Δ Shannon Diversity (100% Cogongrass)",
+    fill = "Change"
+  )
+```
+
+

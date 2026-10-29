@@ -1,6 +1,6 @@
 ---
 title: "Scree Plots"
-author: "Alan Ivory"
+author: "Ann."
 date: "`r Sys.Date()`"
 output: html_document
 ---
@@ -12,27 +12,27 @@ pacman::p_load(dplyr, readxl, tidyr, raster, vegan, tigris, sf, sp, plotly, ggre
 
 
 # Tree PCQ Data
-tree_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+tree_data <- read_excel("/Field_Data_FL_AL_MS.xlsx",
                         sheet = "Tree_PCQ")
 
 # Soil Data
-fuel_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+fuel_data <- read_excel("/Field_Data_FL_AL_MS.xlsx",
                         sheet = "Fuel_Sampling")
 
 # Veg Data
-Veg_Cover <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+Veg_Cover <- read_excel("/Field_Data_FL_AL_MS.xlsx",
                         sheet = "Veg_Cover")
 
 # Shrub Cover Data
-shrub_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+shrub_data <- read_excel("/Field_Data_FL_AL_MS.xlsx",
                          sheet = "Shrub_Cover")
 
 # Ground Cover Data
-ground_cover <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+ground_cover <- read_excel("/Field_Data_FL_AL_MS.xlsx",
                            sheet = "Ground_Cover")
 
 # Site Data
-CogonSites <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/CogonSites_FL_AL_MS.xlsx")
+CogonSites <- read_excel("/CogonSites_FL_AL_MS.xlsx")
 
 # Count the total number of quadrats per plot
 quadrat_count <- Veg_Cover %>%
@@ -171,7 +171,7 @@ for (thresh in rarity_thresholds) {
     next
   }
   
-  # Inner loop for k values
+  # Loop for k values
   for (k_val in k_values) {
     set.seed(123)
     nmds_run <- metaMDS(
@@ -220,7 +220,6 @@ ggplot(all_stress_results, aes(x = k, y = stress, color = as.factor(rarity))) +
 
 ## Final NMDS
 ```{r final_nmds}
-
 species_matrix <- create_matrix_by_rarity(
   rarity_threshold = 0,
   tree_data_raw = tree_data,
@@ -518,7 +517,7 @@ run_region_nmds <- function(region_sites,
     filter(Plot %in% permanova_data$Plot) %>%
     arrange(match(Plot, permanova_data$Plot))
   
-  # Final safety check
+  # Safety check
   stopifnot(all(permanova_data$Plot == region_species_matrix$Plot))
   
   # Create distance matrix
@@ -681,7 +680,7 @@ make_region_plot <- function(results_object, region_title, x_range, y_range) {
     )
 }
 
-# Compute shared axis limits across all three regions
+# Shared axis limits across all three regions
 all_scores <- bind_rows(
   central_results$site_scores,
   north_results$site_scores,

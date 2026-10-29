@@ -1,0 +1,941 @@
+---
+title: "Reworked Biodiversity"
+author: "Ann."
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup}
+pacman::p_load(randomForest, Boruta, caret, tidyverse, vip, pdp,
+               sf, corrplot, gridExtra, scales, grid, spdep, adespatial, tibble,
+               readxl, terra, patchwork)
+
+EnvironmentalOutputs <- read_excel("/Environmental_Outputs.xlsx")
+
+social_data <- read_excel("/Social_Outputs.xlsx")
+
+# Merge Environmental and Social Data
+EnvironmentalOutputs <- EnvironmentalOutputs %>%
+  left_join(social_data, by = "Plot")
+
+# Tree PCQ Data
+tree_data <- read_excel("/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Tree_PCQ")
+
+# Veg Data
+Veg_Cover <- read_excel("/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Veg_Cover")
+
+# Shrub Cover Data
+shrub_data <- read_excel("/Field_Data_FL_AL_MS.xlsx",
+                         sheet = "Shrub_Cover")
+
+# Site Data
+CogonSites <- read_excel("/CogonSites_FL_AL_MS.xlsx")
+```
+
+## Tree Canopy
+```{r Tree_Canopy}
+canopy_plot_avg <- Veg_Cover %>%
+  distinct(Plot, Quadrat, Canopy_Cover) %>%
+  group_by(Plot) %>%
+  summarise(
+    mean_canopy_cover_plot = mean(Canopy_Cover, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+EnvironmentalOutputs <- EnvironmentalOutputs %>%
+  left_join(canopy_plot_avg, by = "Plot")
+
+cor(EnvironmentalOutputs$TreeCanopy_NLCD,
+    EnvironmentalOutputs$mean_canopy_cover_plot,
+    use = "complete.obs")
+```
+
+## Extract data from tif
+```{r Extract_TIF}
+agb_raster <- rast("/TreeMap2022_CONUS_DRYBIO_L.tif")
+
+points <- vect(EnvironmentalOutputs,
+               geom = c("Longitude", "Latitude"),
+               crs = "EPSG:4326")
+
+agb_vals <- extract(agb_raster, points)
+
+EnvironmentalOutputs$agb <- agb_vals[,2]
+```
+
+## Extract Soil Data
+```{r Extract_Soil}
+# Load raster
+r_out <- rast("/taxorder_CONUS_30m.tif")
+
+# Reproject points to match raster CRS
+points_proj <- project(points, crs(r_out))
+
+# Soil value extract
+soil_vals <- extract(r_out, points_proj)
+
+# Add soil type to EnvironmentalOutputs
+EnvironmentalOutputs$SoilType <- soil_vals$taxorder
+table(EnvironmentalOutputs$SoilType)
+
+# Convert numeric IDs to labeled factor
+soil_lookup <- data.frame(
+  ID = 1:11,
+  SoilOrder = c("Alfisols","Andisols","Aridisols","Entisols","Gelisols",
+                "Histosols","Inceptisols","Mollisols","Spodosols","Ultisols","Vertisols")
+)
+
+soil_vals$SoilType <- soil_lookup$SoilOrder[soil_vals$taxorder]
+
+EnvironmentalOutputs$SoilType <- as.factor(soil_vals$SoilType)
+```
+
+## NLCD
+```{r nlcd}
+nlcd <- rast("/Annual_NLCD_LndCov_2024_CU_C1V1.tif")
+
+# Lookup table
+nlcd_table <- data.frame(
+  value = c(11,12,21,22,23,24,31,41,42,43,51,52,71,72,73,74,81,82,90,95),
+  class = c(
+    "Open Water", "Perennial Ice/Snow",
+    "Developed Open", "Developed Low", "Developed Medium", "Developed High",
+    "Barren",
+    "Deciduous Forest", "Evergreen Forest", "Mixed Forest",
+    "Dwarf Scrub", "Shrub/Scrub",
+    "Grassland", "Sedge", "Lichens", "Moss",
+    "Pasture/Hay", "Cultivated Crops",
+    "Woody Wetlands", "Emergent Wetlands"
+  )
+)
+
+levels(nlcd) <- nlcd_table
+plot(nlcd)
+points(points_proj, col = "red", pch = 16)
+
+nlcd_vals <- extract(nlcd, points_proj, bind = TRUE)
+
+str(nlcd_vals)
+nrow(nlcd_vals)
+
+nlcd_df <- as.data.frame(nlcd_vals)
+str(nlcd_df)
+
+nlcd_column <- nlcd_df[, ncol(nlcd_df)]
+
+nlcd_vals <- extract(nlcd, points_proj)
+
+comparison <- cbind(EnvironmentalOutputs,
+                    NLCD_extracted = nlcd_vals[,2])
+
+comparison <- comparison %>%
+  dplyr::select(Plot, NLCD_LandCover, NLCD_extracted)
+
+comparison$NLCD_LandCover <- as.character(comparison$NLCD_extracted)
+```
+
+
+## Number of quadrats sampled per plot
+```{r Quadrats_All}
+# Count the total number of quadrats per plot
+quadrat_count <- Veg_Cover %>%
+  group_by(Plot) %>%
+  summarize(total_quadrats = n_distinct(Quadrat), .groups = "drop")
+```
+
+## Filter All data to only include specified species (Per PLANTS database)
+
+```{r Filter_All}
+#Filter tree data to only include trees with "tree" in the growth column
+tree_data <- dplyr::filter(tree_data, Growth == "Tree")
+
+#Filter Veg Cover to exclude Shrubs and Trees
+Veg_Cover <- dplyr::filter(Veg_Cover, Growth != "Shrub" & Growth != "Tree")
+
+#Filter Shrub Cover to only include Shrubs and Trees
+shrub_data <- dplyr::filter(shrub_data, Growth == "Shrub" | Growth == "Tree")
+
+```
+
+
+## Shrub Cover Conversion
+
+```{r Shrub_Cover_All}
+# Total length of Shrub cover at a site
+shrub_cover <- shrub_data %>%
+  mutate(Cover = Line_End - Line_Start) %>%
+  group_by(Species_Name, Plot, InvStatus) %>%
+  summarise(Total_Cover = sum(Cover, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Percent_Cover = Total_Cover / 3000 * 100)
+```
+
+## Herbacous Cover Conversion
+
+```{r Cogon_Site_All}
+# Combine Plot and Quadrat columns
+Veg_Cover <- Veg_Cover %>%
+  mutate(Plot_Quadrat = paste(Plot, Quadrat, sep = '_'))
+
+# Join with CogonSites to get site information
+Veg_Cover <- Veg_Cover %>%
+  left_join(CogonSites, by = "Plot")
+
+# Sum species cover across quadrats for each species at each plot
+veg_cover_summed <- Veg_Cover %>%
+  group_by(Plot, Species_Name, InvStatus) %>%
+  summarize(total_cover = sum(Cover_Per, na.rm = TRUE), .groups = "drop")
+
+# Calculate average herbaceous species cover
+avg_species_cover <- veg_cover_summed %>%
+  left_join(quadrat_count, by = "Plot") %>%
+  mutate(avg_cover = total_cover / total_quadrats)
+
+```
+
+## Merging Herb cover with Shrub
+
+This species matrix includes herbaceous and shrub species
+
+```{r Herb_Shrub_All}
+
+# Merge shrub cover with herbaceous average cover
+combined_cover <- avg_species_cover %>%
+  full_join(
+    shrub_cover %>%
+      dplyr::select(Plot, Species_Name, Percent_Cover, InvStatus),
+    by = c("Plot", "Species_Name")
+  ) %>%
+  mutate(
+    overlap_flag = ifelse(!is.na(avg_cover) & !is.na(Percent_Cover), TRUE, FALSE),
+    final_cover = case_when(
+      !is.na(avg_cover) & is.na(Percent_Cover) ~ avg_cover,  # Use herbaceous cover if no shrub data
+      is.na(avg_cover) & !is.na(Percent_Cover) ~ Percent_Cover, # Use shrub cover if no herbaceous data
+      TRUE ~ NA_real_ # Leave as NA where overlaps exist
+    )
+  )
+
+```
+
+## Extract Cogongrass Cover
+```{r Cogon_Cover}
+# Extract cogongrass cover
+cogongrass_cover <- combined_cover %>%
+  filter(Species_Name == "Imperata_cylindrica") %>%
+  dplyr::select(Plot, final_cover) %>%
+  rename(Cogongrass_Cover = final_cover)
+
+```
+
+
+# Species Matrix
+```{r Species_Matrix}
+combined_cover <- combined_cover %>%
+  filter(Species_Name != "Imperata_cylindrica" , Species_Name != "Imperata_cylindrica_Live") # Remove cogongrass from species matrix
+
+## Remove any non_native species
+combined_cover <- combined_cover %>%
+  filter(InvStatus.x != "Non_Native") # Remove non-native species from species matrix
+
+species_matrix <- combined_cover %>%
+  dplyr::select(Plot, Species_Name, final_cover) %>%
+  pivot_wider(
+    names_from = Species_Name,
+    values_from = final_cover,
+    values_fill = 0
+  )
+```
+
+## Shannon Diversity
+```{r Shannon}
+# Calculate Shannon diversity index for each site
+shannon_diversity <- species_matrix %>%
+  dplyr::select(-Plot) %>%
+  vegan::diversity(index = "shannon") %>%
+  as.data.frame() %>%
+  setNames("Shannon_Diversity") %>%
+  mutate(Plot = species_matrix$Plot)
+
+```
+
+## Merge Shannon Diversity with Cogongrass Cover and Environmental Data
+```{r Merge_Shannon}
+# Merge Shannon diversity with cogongrass cover, tree canopy cover, and environmental outputs
+model_data <- shannon_diversity %>%
+  left_join(cogongrass_cover, by = "Plot") %>%
+  left_join(EnvironmentalOutputs, by = "Plot") %>%
+  mutate(
+    Cogongrass_Cover = ifelse(is.na(Cogongrass_Cover), 0, Cogongrass_Cover),
+    NLCD_LandCover = case_when(
+      NLCD_LandCover %in% c("Cultivated_Crop",
+                            "Woody_Wetland",
+                            "Emergent_Herbaceous_Wetlands") ~ "Deciduous",
+      TRUE                                                  ~ NLCD_LandCover
+    )
+  )
+
+model_data %>% count(NLCD_LandCover)
+```
+
+## Check Distribution of Response Variable
+```{r Distribution_Check}
+hist(model_data$Shannon_Diversity, breaks=30, main="Histogram of Shannon Diversity", xlab="Shannon Diversity")
+summary(model_data$Shannon_Diversity)
+
+```
+
+
+
+## Model Data Preparation
+```{r Model_Data_Preparation}
+set.seed(97)
+
+# convert categorical variables to numeric
+model_data$NLCD_LandCover <- as.numeric(as.factor(model_data$NLCD_LandCover))
+model_data$Field_LandCover <- as.numeric(as.factor(model_data$Field_LandCover))
+model_data$SoilType <- as.numeric(as.factor(model_data$SoilType))
+model_data$Site <- as.numeric(as.factor(model_data$Site))
+
+str(model_data)
+
+env_predictors <- model_data[, c("Cogongrass_Cover", "elevation", "aspect",
+                                  "slope", "pr", "sph", "srad", "tmmn",
+                                  "TreeCanopy_NLCD", "NLCD_LandCover",
+                                  "SoilType", "ndvi", "avg_pop_den_1km",
+                                  "road_density_1km")]
+
+
+all_predictors <- cbind(env_predictors)
+
+model_df <- cbind(Shannon_Diversity = model_data$Shannon_Diversity,
+                  all_predictors) %>%
+  na.omit()
+
+cat(sprintf("  Environmental predictors : %d\n", ncol(env_predictors)))
+cat(sprintf("  Total predictors         : %d\n", ncol(all_predictors)))
+cat(sprintf("  Observations (post-NA)   : %d\n\n", nrow(model_df)))
+```
+
+## Correlation Check
+```{r correlation_matrix}
+cor_matrix <- cor(model_df, use = "complete.obs")
+
+png("correlation_matrix.png", width = 900, height = 800, res = 120)
+corrplot(cor_matrix, method = "color", type = "upper", tl.cex = 0.75,
+         addCoef.col = "black", number.cex = 0.55,
+         title = "Predictor Correlation Matrix", mar = c(0,0,1,0))
+dev.off()
+cat("Correlation matrix saved.\n")
+
+# Compute correlation matrix for predictors only
+pred_cor <- cor(model_df[, -1], use = "complete.obs")  # remove Shannon_Diversity
+
+# Find pairs with |r| > 0.9
+high_cor_pairs <- findCorrelation(pred_cor, cutoff = 0.9, names = TRUE, verbose = TRUE)
+
+if ("pr" %in% high_cor_pairs) {
+  # Get all variables highly correlated with 'pr'
+  pr_cor_vars <- names(which(abs(pred_cor["pr", ]) > 0.9))
+  pr_cor_vars <- setdiff(pr_cor_vars, "pr")
+
+  # Remove these variables instead of pr
+  high_cor_pairs <- setdiff(high_cor_pairs, "pr")
+  high_cor_pairs <- unique(c(high_cor_pairs, pr_cor_vars))
+}
+
+# Remove highly correlated predictors
+if (length(high_cor_pairs) > 0) {
+  cat(sprintf("  Removing %d highly correlated predictors (|r| > 0.9) while keeping 'pr': %s\n",
+              length(high_cor_pairs),
+              paste(high_cor_pairs, collapse = ", ")))
+  model_df <- model_df[, !(colnames(model_df) %in% high_cor_pairs)]
+} else {
+  cat("  No highly correlated predictors (|r| > 0.9) found — no removals necessary.\n")
+}
+```
+
+## Rename Variables for Readability
+```{r Rename_Variables}
+# Lookup table
+var_labels <- c(
+  Cogongrass_Cover = "Cogongrass Cover",
+  elevation         = "Elevation",
+  aspect            = "Aspect",
+  slope             = "Slope",
+  pr                = "Precipitation",
+  sph               = "Specific Humidity",
+  srad              = "Surface Radiation",
+  tmmn              = "Minimum Temperature",
+  TreeCanopy_NLCD   = "Tree Canopy Cover",
+  NLCD_LandCover    = "Land Cover Type",
+  SoilType          = "Soil Order",
+  ndvi              = "NDVI",
+  avg_pop_den_1km   = "Population Density",
+  road_density_1km  = "Road Density"
+)
+
+clean_label <- function(x) ifelse(x %in% names(var_labels), var_labels[x], x)
+
+cat("Variable display labels defined:\n")
+print(var_labels)
+```
+
+## Variable Selection- Boruta
+```{r Variable_Selection}
+cat("========== STEP 3: Boruta Variable Selection ==========\n")
+cat("  Running Boruta (~ 1 minute)...\n")
+
+boruta_out <- Boruta(Shannon_Diversity ~ ., data = model_df,
+                     doTrace = 1, maxRuns = 150, num.trees = 500)
+boruta_final <- TentativeRoughFix(boruta_out)
+selected_vars <- getSelectedAttributes(boruta_final, withTentative = FALSE)
+
+selected_env <- selected_vars
+
+cat(sprintf("\n  Variables confirmed : %d\n", length(selected_vars)))
+cat(sprintf("  Selected predictors : %d  (%s)\n",
+            length(selected_env), paste(clean_label(selected_env), collapse = ", ")))
+
+```
+
+## Train/Test Split
+```{r Train_Test_Split}
+model_df_sel <- model_df[, c("Shannon_Diversity", selected_vars)]
+train_idx  <- createDataPartition(model_df_sel$Shannon_Diversity, p = 0.8, list = FALSE)
+train_data <- model_df_sel[ train_idx, ]
+test_data  <- model_df_sel[-train_idx, ]
+```
+
+## Tune Random Forest via Cross-Validation
+```{r RF_Tuning}
+cat("========== STEP 4: Tuning Random Forest (10-fold CV) ==========\n")
+
+ctrl      <- trainControl(method = "cv", number = 10, verboseIter = FALSE)
+tune_grid <- expand.grid(mtry = seq(2, max(2, floor(sqrt(length(selected_vars))) + 3), by = 1))
+
+rf_tuned <- train(Shannon_Diversity ~ .,
+                  data       = train_data,
+                  method     = "rf",
+                  trControl  = ctrl,
+                  tuneGrid   = tune_grid,
+                  ntree      = 500,
+                  importance = TRUE)
+
+best_mtry <- rf_tuned$bestTune$mtry
+cat(sprintf("  Best mtry: %d\n\n", best_mtry))
+
+rf_final <- randomForest(Shannon_Diversity ~ .,
+                         data       = train_data,
+                         ntree      = 1000,
+                         mtry       = best_mtry,
+                         importance = TRUE)
+
+print(rf_final)
+```
+
+## Evaluate on Test Set
+```{r RF_Evaluation}
+cat("========== STEP 5: Model Evaluation ==========\n")
+
+pred_test <- predict(rf_final, newdata = test_data)
+bias_val <- mean(pred_test - test_data$Shannon_Diversity)
+rel_bias <- bias_val / mean(test_data$Shannon_Diversity) * 100
+rmse_val  <- sqrt(mean((pred_test - test_data$Shannon_Diversity)^2))
+mae_val   <- mean(abs(pred_test - test_data$Shannon_Diversity))
+ss_res    <- sum((pred_test - test_data$Shannon_Diversity)^2)
+ss_tot    <- sum((test_data$Shannon_Diversity - mean(test_data$Shannon_Diversity))^2)
+r2_val    <- 1 - ss_res / ss_tot
+
+cat(sprintf("  RMSE : %.4f\n", rmse_val))
+cat(sprintf("  MAE  : %.4f\n", mae_val))
+cat(sprintf("  Bias : %.4f\n", bias_val))
+cat(sprintf("  Relative Bias : %.2f%%\n", rel_bias))
+cat(sprintf("  R²   : %.4f\n\n", r2_val))
+
+# Predicted vs observed plot
+pred_obs_df <- data.frame(Observed = test_data$Shannon_Diversity,
+                          Predicted = pred_test)
+
+p_pred <- ggplot(pred_obs_df, aes(x = Observed, y = Predicted)) +
+  geom_point(alpha = 0.7, colour = "#2E8B57", size = 2.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  annotate("text", x = min(pred_obs_df$Observed) + 0.05,
+           y = max(pred_obs_df$Predicted) - 0.1,
+           label = sprintf("R² = %.3f\nRMSE = %.3f", r2_val, rmse_val),
+           hjust = 0, size = 4.5) +
+  labs(title = "",
+       x = "Observed", y = "Predicted") +
+  theme_bw(base_size = 13)
+
+ggsave("predicted_vs_observed.png", p_pred, width = 6, height = 5, dpi = 150)
+```
+
+
+## Full-Data Model for Importance and Partial Dependence
+```{r Full_Data_Model}
+set.seed(97)
+rf_pdp    <- randomForest(Shannon_Diversity ~ ., data = model_df_sel,
+                          ntree = 5000, mtry = best_mtry, importance = TRUE)
+pdp_train <- model_df_sel
+
+imp_df <- as.data.frame(importance(rf_pdp)) %>%
+  rownames_to_column("Variable") %>%
+  mutate(Label = clean_label(Variable)) %>%
+  arrange(desc(`%IncMSE`))
+
+print(imp_df[, c("Label", "%IncMSE")])
+
+## Unscaled equivalent
+imp_raw <- as.data.frame(importance(rf_pdp, scale = FALSE)) %>%
+  rownames_to_column("Variable") %>%
+  mutate(Label = clean_label(Variable)) %>%
+  arrange(desc(`%IncMSE`))
+
+cat("\nUnscaled (raw mean decrease in MSE, independent of ntree):\n")
+print(imp_raw[, c("Label", "%IncMSE")])
+```
+
+## Variable Importance Plot (combined Boruta + final RF)
+```{r RF_Variable_Importance}
+
+conf_green  <- "#1B7837"
+rej_red     <- "#B2182B"
+shadow_blue <- "#4393C3"
+
+## ---- Panel A: Boruta ----------------------------------------------------
+imp_long <- as.data.frame(boruta_final$ImpHistory) %>%
+  tidyr::pivot_longer(dplyr::everything(),
+                      names_to = "Variable", values_to = "Importance") %>%
+  dplyr::filter(is.finite(Importance))
+
+dec <- data.frame(Variable = names(boruta_final$finalDecision),
+                  Decision = as.character(boruta_final$finalDecision),
+                  stringsAsFactors = FALSE)
+
+imp_long <- imp_long %>%
+  dplyr::mutate(
+    is_shadow = grepl("^shadow", Variable),
+    Decision  = ifelse(is_shadow, "Shadow",
+                       dec$Decision[match(Variable, dec$Variable)]),
+    Label     = ifelse(is_shadow,
+                       sub("^shadow", "Shadow ", Variable),
+                       unname(clean_label(Variable)))
+  )
+
+## order by median importance
+ord <- imp_long %>%
+  dplyr::group_by(Label) %>%
+  dplyr::summarise(med = median(Importance), .groups = "drop") %>%
+  dplyr::arrange(med) %>%
+  dplyr::pull(Label)
+imp_long$Label <- factor(imp_long$Label, levels = ord)
+
+p_boruta <- ggplot(imp_long, aes(Label, Importance, fill = Decision)) +
+  geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.3) +
+  geom_boxplot(outlier.size = 0.5, linewidth = 0.3, width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c(Confirmed = conf_green,
+                               Rejected  = rej_red,
+                               Shadow    = shadow_blue,
+                               Tentative = "#F4A582"),
+                    breaks = c("Confirmed", "Rejected", "Shadow"),
+                    name   = NULL) +
+  labs(x = NULL, y = "Boruta importance",
+       title = "A) Boruta Feature Selection") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold", size = 11),
+        legend.position  = c(0.82, 0.16),
+        legend.background = element_rect(fill = scales::alpha("white", 0.8),
+                                         colour = NA),
+        legend.key.size  = ggplot2::unit(0.4, "cm"),
+        legend.text      = element_text(size = 8))
+
+## ---- Panel B: final random forest ---------------------------------------
+p_rf <- ggplot(imp_df, aes(reorder(Label, `%IncMSE`), `%IncMSE`)) +
+  geom_col(fill = conf_green, alpha = 0.9, width = 0.7) +
+  coord_flip() +
+  labs(x = NULL, y = "Increase in MSE (%)",
+       title = "B) Final Random Forest") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold", size = 11))
+
+## ---- Combine -------------------------------------------------------------
+fig_importance <- p_boruta + p_rf + patchwork::plot_layout(widths = c(1.1, 1))
+
+ggsave("variable_importance_combined.png", fig_importance,
+       width = 11, height = 5.5, units = "in", dpi = 300, bg = "white")
+
+ggsave("boruta_importance_gg.png", p_boruta, width = 6, height = 5.5,
+       units = "in", dpi = 300, bg = "white")
+ggsave("variable_importance.png",  p_rf,     width = 6, height = 4.5,
+       units = "in", dpi = 300, bg = "white")
+
+cat("Combined importance figure saved.\n")
+print(imp_df[, c("Label", "%IncMSE")])
+```
+
+
+## Partial Dependence Plots (Top 4 Variables)
+```{r PDP_Top4}
+top4_env <- imp_df %>%
+  slice_head(n = 4) %>%
+  pull(Variable)
+
+pdp_plots <- lapply(top4_env, function(var) {
+  pd <- partial(rf_final, pred.var = var, train = train_data)
+  autoplot(pd) +
+    labs(title = clean_label(var), x = clean_label(var), y = "Shannon Diversity") +
+    theme_bw(base_size = 11)
+})
+```
+
+
+## Partial Dependence Plots
+```{r PDP_pub}
+gator_blue   <- "#0021A5"
+gator_orange <- "#0021A5"   # was the blue hex, so ribbon and line matched
+ 
+n_boot <- 50
+ 
+## ---- Panel order: cogongrass first, then importance --------------
+focus_var    <- "Cogongrass_Cover"
+selected_env <- c(focus_var, setdiff(imp_df$Variable, focus_var))
+imp_lookup   <- setNames(imp_df$`%IncMSE`, imp_df$Variable)
+ 
+print(imp_df[, c("Variable", "%IncMSE")])
+ 
+## ---- State which predictors are categorical ---------------
+categorical_vars <- c("SoilType")
+ 
+# as.numeric(as.factor()) assigns codes alphabetically
+soil_levels <- c("Alfisols", "Entisols", "Spodosols", "Ultisols")
+ 
+var_labels <- list(
+  Cogongrass_Cover = "Cogongrass Cover (%)",
+  pr               = "Precipitation (mm)",
+  srad             = expression(paste("Surface Radiation (W/", m^2, ")")),
+  TreeCanopy_NLCD  = "Tree Canopy (%)",
+  elevation        = "Elevation (m)",
+  slope            = "Slope (degrees)",
+  SoilType         = "Soil Order",
+  avg_pop_den_1km  = expression(paste("Population Density (people/", km^2, ")")),
+  ndvi             = "NDVI",
+  sph              = "Specific Humidity (g/kg)"
+)
+ 
+## ---- Fixed prediction grid per variable ------------------------------
+make_grid <- function(var) {
+  x <- pdp_train[[var]]
+  g <- if (var %in% categorical_vars) {
+    sort(unique(x))
+  } else {
+    seq(min(x, na.rm = TRUE), max(x, na.rm = TRUE), length.out = 30)
+  }
+  setNames(data.frame(g), var)
+}
+pred_grids <- setNames(lapply(selected_env, make_grid), selected_env)
+ 
+## ---- Bootstrap the forest once, read every PDP off each fit ----------
+set.seed(97)
+boot_fits <- lapply(seq_len(n_boot), function(j) {
+  idx <- sample(nrow(pdp_train), replace = TRUE)
+  tb  <- pdp_train[idx, ]
+  list(fit = randomForest(Shannon_Diversity ~ ., data = tb, ntree = 500),
+       dat = tb)
+})
+ 
+pdp_data_list <- lapply(selected_env, function(var) {
+ 
+  pd_all <- map_dfr(seq_along(boot_fits), function(j) {
+    pd <- partial(boot_fits[[j]]$fit,
+                  pred.var  = var,
+                  pred.grid = pred_grids[[var]],
+                  train     = boot_fits[[j]]$dat)
+    pd$iter <- j
+    pd
+  })
+ 
+  pd_summary <- pd_all %>%
+    group_by(x = .data[[var]]) %>%
+    summarise(y    = mean(yhat),
+              ymin = quantile(yhat, 0.025),
+              ymax = quantile(yhat, 0.975),
+              .groups = "drop") %>%
+    arrange(x) %>%
+    mutate(Variable = var)
+ 
+  ## smooth
+  if (!(var %in% categorical_vars) && nrow(pd_summary) >= 10) {
+    pd_summary %>%
+      mutate(y_smooth    = loess(y    ~ x, span = 0.6)$fitted,
+             ymin_smooth = loess(ymin ~ x, span = 0.6)$fitted,
+             ymax_smooth = loess(ymax ~ x, span = 0.6)$fitted)
+  } else {
+    pd_summary %>%
+      mutate(y_smooth = y, ymin_smooth = ymin, ymax_smooth = ymax)
+  }
+})
+names(pdp_data_list) <- selected_env
+ 
+## ---- Shared y-axis across panels -------------------------------------
+all_pdp  <- bind_rows(pdp_data_list)
+y_rng    <- range(c(all_pdp$ymin_smooth, all_pdp$ymax_smooth), na.rm = TRUE)
+y_pad    <- 0.05 * diff(y_rng)
+y_limits <- c(y_rng[1] - y_pad, y_rng[2] + y_pad)
+ 
+panel_labels <- LETTERS[seq_along(selected_env)]
+ 
+pdp_boot_list <- lapply(seq_along(selected_env), function(i) {
+ 
+  var <- selected_env[i]
+  d   <- pdp_data_list[[var]]
+  lab <- sprintf("%s   %%IncMSE = %.1f", panel_labels[i], imp_lookup[[var]])
+ 
+  if (var %in% categorical_vars) {
+    d$x_lab <- factor(soil_levels[d$x], levels = soil_levels)
+    p <- ggplot(d, aes(x = x_lab)) +
+      geom_errorbar(aes(ymin = ymin, ymax = ymax),
+                    width = 0.15, colour = gator_blue) +
+      geom_point(aes(y = y), colour = gator_blue, size = 2.5)
+  } else {
+    p <- ggplot(d, aes(x = x)) +
+      geom_ribbon(aes(ymin = ymin_smooth, ymax = ymax_smooth),
+                  fill = gator_orange, alpha = 0.25) +
+      geom_line(aes(y = y_smooth), colour = gator_blue, linewidth = 1.2)
+  }
+ 
+  if (var == "Cogongrass_Cover") {
+    p <- p +
+      geom_vline(xintercept = 70, linetype = "dashed",
+                 colour = "grey30", linewidth = 0.6)
+  }
+
+  p +
+    coord_cartesian(ylim = y_limits) +
+    labs(x = var_labels[[var]], y = NULL) +
+    annotate("text", x = -Inf, y = Inf, label = lab,
+             hjust = -0.08, vjust = 1.5, fontface = "bold", size = 3.4) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.title.x = element_text(size = 10),
+      axis.text    = element_text(size = 9),
+      axis.text.x  = if (var %in% categorical_vars)
+        element_text(angle = 45, hjust = 1, size = 8) else element_text(size = 9),
+      plot.margin  = ggplot2::margin(5, 5, 5, 5)
+    )
+})
+ 
+## ---- Save ------------------------------------------------------------
+
+png("partial_dependence_bootstrap.png",
+    width = 1050, height = 1150, res = 150)
+ 
+grid.arrange(
+  textGrob("Shannon Diversity", rot = 90,
+           gp = gpar(fontsize = 14, fontface = "bold")),
+  arrangeGrob(grobs = pdp_boot_list, ncol = 3),
+  ncol = 2, widths = c(0.05, 0.95)
+)
+ 
+dev.off()
+ 
+cat("\nPanel order (A onward):\n")
+print(data.frame(Panel = panel_labels,
+                 Variable = selected_env,
+                 IncMSE = round(unname(imp_lookup[selected_env]), 2)))
+ 
+```
+
+
+## Effect Magnitude
+```{r PDP_Effect_Ranges}
+
+plain_labels <- c(
+  Cogongrass_Cover = "Cogongrass Cover",
+  pr               = "Precipitation",
+  srad             = "Surface Radiation",
+  TreeCanopy_NLCD  = "Tree Canopy Cover",
+  elevation        = "Elevation",
+  slope            = "Slope",
+  SoilType         = "Soil Order",
+  avg_pop_den_1km  = "Population Density",
+  ndvi             = "NDVI",
+  sph              = "Specific Humidity"
+)
+
+pdp_spans <- bind_rows(pdp_data_list) %>%
+  group_by(Variable) %>%
+  summarise(
+    pdp_min = min(y_smooth, na.rm = TRUE),
+    pdp_max = max(y_smooth, na.rm = TRUE),
+    span    = pdp_max - pdp_min,
+    .groups = "drop"
+  ) %>%
+  left_join(imp_df[, c("Variable", "%IncMSE")], by = "Variable") %>%
+  mutate(Label = unname(plain_labels[Variable])) %>%
+  arrange(desc(span)) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+print(as.data.frame(pdp_spans[, c("Label", "span", "pdp_min", "pdp_max", "%IncMSE")]))
+
+cog     <- pdp_spans %>% filter(Variable == "Cogongrass_Cover")
+top_env <- pdp_spans %>% filter(Variable != "Cogongrass_Cover") %>% slice_max(span, n = 1)
+
+cat(sprintf(
+  "\n  Cogongrass span            : %.3f units\n  Largest environmental span : %.3f units (%s)\n  Ratio                      : %.1fx\n",
+  cog$span, top_env$span, top_env$Label, cog$span / top_env$span))
+```
+
+## Soil Order Contrast
+```{r Soil_Order_Contrast}
+
+soil_boot <- map_dfr(seq_along(boot_fits), function(j) {
+  pd <- partial(boot_fits[[j]]$fit,
+                pred.var  = "SoilType",
+                pred.grid = pred_grids[["SoilType"]],
+                train     = boot_fits[[j]]$dat)
+  pd$iter <- j
+  pd
+}) %>%
+  mutate(Order = soil_levels[SoilType])
+
+## Every pairwise contrast, with bootstrap 95% intervals
+soil_wide <- soil_boot %>%
+  dplyr::select(iter, Order, yhat) %>%
+  pivot_wider(names_from = Order, values_from = yhat)
+
+pairs_tbl <- combn(soil_levels, 2, simplify = FALSE) %>%
+  map_dfr(function(pr) {
+    d <- soil_wide[[pr[1]]] - soil_wide[[pr[2]]]
+    tibble(contrast = paste(pr[1], "-", pr[2]),
+           median   = median(d),
+           lo       = quantile(d, 0.025),
+           hi       = quantile(d, 0.975),
+           excl_0   = !(quantile(d, 0.025) < 0 & quantile(d, 0.975) > 0))
+  }) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+cat("===== Soil order: pairwise partial dependence contrasts =====\n")
+print(as.data.frame(pairs_tbl))
+cat(sprintf("\nContrasts whose 95%% interval excludes zero: %d of %d\n",
+            sum(pairs_tbl$excl_0), nrow(pairs_tbl)))
+
+cog_boot <- map_dfr(seq_along(boot_fits), function(j) {
+  pd <- partial(boot_fits[[j]]$fit,
+                pred.var  = "Cogongrass_Cover",
+                pred.grid = pred_grids[["Cogongrass_Cover"]],
+                train     = boot_fits[[j]]$dat)
+  pd$iter <- j
+  pd
+})
+
+cog_ends <- cog_boot %>%
+  group_by(iter) %>%
+  summarise(d = yhat[which.max(Cogongrass_Cover)] - yhat[which.min(Cogongrass_Cover)],
+            .groups = "drop")
+
+cat(sprintf(
+  "\nCogongrass: highest observed cover vs 0%%\n  median %.3f units, 95%% interval %.3f to %.3f\n",
+  median(cog_ends$d), quantile(cog_ends$d, 0.025), quantile(cog_ends$d, 0.975)))
+
+
+soil_obs <- model_df_sel %>%
+  mutate(Order = soil_levels[SoilType]) %>%
+  filter(Order != "Spodosols")
+
+kw <- kruskal.test(Shannon_Diversity ~ factor(Order), data = soil_obs)
+cat(sprintf(
+  "\nObserved Shannon diversity by soil order (Spodosols excluded, n = %d):\n  Kruskal-Wallis chi-squared = %.3f, df = %d, P = %.3f\n",
+  nrow(soil_obs), kw$statistic, kw$parameter, kw$p.value))
+
+print(soil_obs %>% group_by(Order) %>%
+        summarise(n = n(), median_SHDI = round(median(Shannon_Diversity), 3),
+                  .groups = "drop") %>% as.data.frame())
+```
+
+## Importance Rank Stability
+```{r Importance_Rank_Stability}
+
+set.seed(97)
+n_rep <- 100
+
+rank_reps <- map_dfr(seq_len(n_rep), function(i) {
+  idx <- createDataPartition(model_df_sel$Shannon_Diversity, p = 0.8, list = FALSE)
+  rf  <- randomForest(Shannon_Diversity ~ .,
+                      data = model_df_sel[idx, ],
+                      ntree = 1000, mtry = best_mtry, importance = TRUE)
+  as.data.frame(importance(rf)) %>%
+    rownames_to_column("Variable") %>%
+    mutate(rank = rank(-`%IncMSE`), iter = i) %>%
+    dplyr::select(Variable, IncMSE = `%IncMSE`, rank, iter)
+})
+
+rank_summary <- rank_reps %>%
+  group_by(Variable) %>%
+  summarise(median_rank = median(rank),
+            rank_min    = min(rank),
+            rank_max    = max(rank),
+            pct_top1    = 100 * mean(rank == 1),
+            median_imp  = median(IncMSE),
+            imp_lo      = quantile(IncMSE, 0.025),
+            imp_hi      = quantile(IncMSE, 0.975),
+            .groups = "drop") %>%
+  arrange(median_rank) %>%
+  mutate(across(where(is.numeric), ~round(.x, 2)))
+
+cat("===== Importance rank across", n_rep, "train/test splits =====\n")
+print(as.data.frame(rank_summary))
+
+cog_r <- rank_reps %>% filter(Variable == "Cogongrass_Cover")
+cat(sprintf(
+  "\nCogongrass cover: median rank %.0f (range %d-%d), ranked 1st in %.0f%% of splits\n",
+  median(cog_r$rank), min(cog_r$rank), max(cog_r$rank), 100 * mean(cog_r$rank == 1)))
+
+
+full_imp <- as.data.frame(importance(rf_pdp)) %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(`%IncMSE`)) %>%
+  mutate(across(where(is.numeric), ~round(.x, 2)))
+
+cat("\n===== Importance from a model fit to all 206 plots =====\n")
+print(as.data.frame(full_imp[, c("Variable", "%IncMSE")]))
+```
+
+## Summary Output
+```{r Summary_Output}
+cat("============================================================\n")
+cat("  RANDOM FOREST MODEL SUMMARY\n")
+cat("============================================================\n")
+cat(sprintf("  Selected predictors : %d\n", length(selected_vars)))
+cat("------------------------------------------------------------\n")
+cat(sprintf("  Test RMSE : %.4f\n", rmse_val))
+cat(sprintf("  Test MAE  : %.4f\n", mae_val))
+cat(sprintf("  Test Bias : %.4f\n", bias_val))
+cat(sprintf("  Relative Bias : %.2f%%\n", rel_bias))
+cat(sprintf("  Test R²   : %.4f\n", r2_val))
+cat("============================================================\n")
+
+saveRDS(rf_final, "shannon_diversity_rf_model.rds")
+cat("\nModel saved as 'shannon_diversity_rf_model.rds'\n")
+```
+
+## Save
+```{r Save_Objects}
+saveRDS(rf_final, "shannon_diversity_rf_model.rds")
+
+soil_codes <- data.frame(model_code = seq_along(levels(EnvironmentalOutputs$SoilType)),
+                         SoilOrder  = levels(EnvironmentalOutputs$SoilType))
+print(soil_codes)   # should be Alfisols, Entisols, Spodosols, Ultisols = 1-4
+saveRDS(soil_codes, "soil_code_lookup.rds")
+
+## Training data
+keep <- as.integer(rownames(model_df_sel))
+all_plots <- cbind(model_df_sel,
+                   Plot = model_data$Plot[keep],
+                   Site = model_data$Site[keep])
+saveRDS(all_plots,  "shannon_model_data_all.rds")
+saveRDS(train_data, "shannon_training_data.rds")   # the 80% split
+```
